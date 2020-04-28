@@ -1,9 +1,10 @@
 package main
 
 import (
-	"encoding/json"
-	"io/ioutil"
-	"path/filepath"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"html"
 	"strconv"
 
 	"github.com/blevesearch/bleve"
@@ -11,50 +12,85 @@ import (
 	"github.com/blevesearch/bleve/analysis/lang/en"
 
 	"git.sr.ht/~mendelmaleh/tgbotapi"
+	"git.sr.ht/~mendelmaleh/xkcd"
 )
+
+var ErrNoHits = errors.New("no search results")
 
 // FTS queries the bleve index and returns a []interface, its
 // elements are tgbotapi.InlineQueryResultPhoto.
-func (bot *Bot) FTS(query string, n int) ([]interface{}, error) {
+func (bot *Bot) FTS(query string, max int) ([]interface{}, error) {
 	search := bleve.NewSearchRequest(bleve.NewQueryStringQuery(query))
-	search.Fields = []string{"num", "alt", "img"}
 	results, err := bot.Bleve.Search(search)
 	if err != nil {
 		return make([]interface{}, 0), err
 	}
 
 	hits := results.Hits
-	if len(hits) > n {
-		hits = hits[:n]
+	if len(hits) == 0 {
+		return make([]interface{}, 0), ErrNoHits
+	} else if max > 0 && len(hits) > max {
+		hits = hits[:max]
 	}
 
 	res := make([]interface{}, len(hits))
 	for i, h := range hits {
-		r := &tgbotapi.InlineQueryResultPhoto{
-			Type: "photo", // must be
+		d, err := bot.Bleve.Document(h.ID)
+		if err != nil {
+			return make([]interface{}, 0), err
 		}
 
-		if v, ok := h.Fields["num"].(float64); ok {
-			r.ID = strconv.Itoa(int(v))
+		var c xkcd.Comic
+		for _, f := range d.Fields {
+			switch f.Name() {
+			case "title":
+				c.Title = string(f.Value())
+			case "alt":
+				c.Alt = string(f.Value())
+			case "img":
+				c.Img = string(f.Value())
+			}
 		}
 
-		if v, ok := h.Fields["alt"].(string); ok {
-			r.Caption = v
+		res[i] = tgbotapi.InlineQueryResultPhoto{
+			Type:      "photo", // must be
+			ID:        h.ID,
+			URL:       c.Img,
+			ThumbURL:  c.Img,
+			Title:     c.Title,
+			ParseMode: "html",
+			Caption: fmt.Sprintf("<a href=\"%s\">#%s:</a> <i>%s</i>",
+				xkcd.DefaultBaseURL+h.ID, h.ID, html.EscapeString(c.Alt)),
 		}
-
-		if v, ok := h.Fields["img"].(string); ok {
-			r.ThumbURL = v
-			r.URL = v
-		}
-
-		res[i] = r
 	}
 
 	return res, nil
 }
 
-func (bot *Bot) IndexData() error {
-	files, err := ioutil.ReadDir(bot.Config.Bleve.Data)
+func (bot *Bot) Update() error {
+	lastByte, err := bot.Bleve.GetInternal(lastKey)
+	if err != nil {
+		return err
+	}
+
+	var lastIndex int
+	switch cap(lastByte) {
+	case 0:
+		lastIndex = 0
+	case 4:
+		lastIndex = int(binary.LittleEndian.Uint32(lastByte))
+	default:
+		return fmt.Errorf(
+			"can't get int from lastByte %q, type %T, len %d, cap %d\n",
+			lastByte, lastByte, len(lastByte), cap(lastByte),
+		)
+	}
+
+	if lastIndex == 0 {
+		lastIndex = 1
+	}
+
+	lastComic, err := bot.XKCD.GetNum(0)
 	if err != nil {
 		return err
 	}
@@ -62,24 +98,19 @@ func (bot *Bot) IndexData() error {
 	batch := bot.Bleve.NewBatch()
 	count := 0
 
-	for _, f := range files {
-		n := f.Name()
+	for i := int(lastIndex); i <= lastComic.Num; i++ {
+		if i == 404 {
+			continue
+		}
 
-		// bytes
-		jsonBytes, err := ioutil.ReadFile(bot.Config.Bleve.Data + "/" + n)
+		// get json, marshal
+		c, err := bot.XKCD.GetNum(i)
 		if err != nil {
 			return err
 		}
 
-		// json
-		var jsonDoc interface{}
-		if err := json.Unmarshal(jsonBytes, &jsonDoc); err != nil {
-			return err
-		}
-
 		// index
-		id := n[:len(n)-len(filepath.Ext(n))]
-		batch.Index(id, jsonDoc)
+		batch.Index(strconv.Itoa(c.Num), c)
 		count++
 
 		// exec batch
@@ -99,6 +130,14 @@ func (bot *Bot) IndexData() error {
 			return err
 		}
 	}
+
+	if lastIndex < 0 || lastIndex > 0xffffffff {
+		return fmt.Errorf("cannot store %d as uint32\n", lastIndex)
+	}
+
+	bs := make([]byte, 4)
+	binary.LittleEndian.PutUint32(bs, uint32(lastComic.Num))
+	bot.Bleve.SetInternal(lastKey, bs)
 
 	return nil
 }

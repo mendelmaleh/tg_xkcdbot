@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -19,7 +22,7 @@ type Config struct {
 	}
 
 	Bleve struct {
-		Index, Data string
+		Index string
 	}
 }
 
@@ -32,6 +35,8 @@ type Bot struct {
 
 	client *http.Client
 }
+
+var lastKey = []byte("last")
 
 func main() {
 	bot := &Bot{}
@@ -60,7 +65,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// bot.Debug = true
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 
 	// get xkcd
@@ -80,36 +84,68 @@ func main() {
 			log.Fatal(err)
 		}
 
-		// index data
-		go func(bot *Bot) {
-			if err := bot.IndexData(); err != nil {
-				log.Fatal(err)
-			}
-			log.Println("Done indexing data")
-		}(bot)
+		// init internal last key
+		if err := bot.Bleve.SetInternal(lastKey, []byte{}); err != nil {
+			log.Fatal(err)
+		}
 
 	} else if err != nil {
 		log.Fatal(err)
 	}
+
+	// index data
+	go func(bot *Bot) {
+		log.Println("Starting indexing data")
+		if err := bot.Update(); err != nil {
+			log.Fatal(err)
+		}
+		log.Println("Done indexing data")
+	}(bot)
 
 	// parse updates
 	updates := bot.GetUpdatesChan(tgbotapi.UpdateConfig{Timeout: 60})
 	for u := range updates {
 		if u.InlineQuery != nil {
 			q := u.InlineQuery
+			query := q.Query
 
-			if q.Query == "" {
+			if query == "" {
 				continue
 			}
 
-			results, err := bot.FTS(q.Query, 5)
+			if len(query) > 1 && query[0] == '#' && isDigit(query[1]) {
+				query = "num:" + query[1:]
+			}
+
+			results, err := bot.FTS(query, 0)
 			if err != nil {
-				continue
-			}
+				switch {
+				case err == ErrNoHits:
+					desc := fmt.Sprintf("No search results found for %q", query)
+					results = make([]interface{}, 1)
 
-			if len(results) < 1 {
-				log.Println("Less than one result")
-				continue
+					results[0] = tgbotapi.InlineQueryResultArticle{
+						Type:                "article", // must be
+						ID:                  "ErrNoHits",
+						Title:               "No results",
+						Description:         desc,
+						InputMessageContent: tgbotapi.InputTextMessageContent{Text: desc},
+					}
+				case err.Error() == "syntax error":
+					desc := fmt.Sprintf("Invalid query syntax %q", query)
+					results = make([]interface{}, 1)
+
+					results[0] = tgbotapi.InlineQueryResultArticle{
+						Type:                "article", // must be
+						ID:                  "ErrInvalidSyntax",
+						Title:               "Invalid Syntax",
+						Description:         desc,
+						InputMessageContent: tgbotapi.InputTextMessageContent{Text: desc},
+					}
+				default:
+					log.Printf("%T: %s\n", err, err)
+					continue
+				}
 			}
 
 			api, err := bot.Send(tgbotapi.InlineConfig{
@@ -117,9 +153,13 @@ func main() {
 				Results:       results,
 			})
 
-			if err != nil {
+			if err != nil && errors.Is(err, &json.UnmarshalTypeError{}) {
 				log.Println(api, err)
 			}
 		}
 	}
+}
+
+func isDigit(b byte) bool {
+	return '0' <= b && b <= '9'
 }
