@@ -95,11 +95,17 @@ func main() {
 
 	// index data
 	go func(bot *Bot) {
-		log.Println("Starting indexing data")
-		if err := bot.Update(); err != nil {
-			log.Fatal(err)
+		t := time.NewTicker(10 * time.Minute)
+		for {
+			log.Println("Starting indexing data")
+			if err := bot.Update(); err != nil {
+				log.Fatal(err)
+			}
+			log.Println("Done indexing data")
+
+			// wait for next tick
+			<-t.C
 		}
-		log.Println("Done indexing data")
 	}(bot)
 
 	// parse updates
