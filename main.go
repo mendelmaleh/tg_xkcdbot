@@ -99,7 +99,7 @@ func main() {
 		for {
 			log.Println("Starting indexing data")
 			if err := bot.Update(); err != nil {
-				log.Fatal(err)
+				log.Print(err)
 			}
 			log.Println("Done indexing data")
 
